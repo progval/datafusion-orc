@@ -20,16 +20,21 @@ pub struct StructArrayDecoder {
 }
 
 impl StructArrayDecoder {
-    pub fn new(column: &Column, fields: Fields, stripe: &Stripe) -> Result<Self> {
+    pub fn new(column: &Column, stripe: &Stripe) -> Result<Self> {
         let present = get_present_vec(column, stripe)?
             .map(|iter| Box::new(iter.into_iter()) as Box<dyn Iterator<Item = bool> + Send>);
 
         let decoders = column
-            .children()
+            .children()?
             .iter()
-            .zip(fields.iter().cloned())
-            .map(|(child, field)| array_decoder_factory(child, field, stripe))
+            .map(|child| array_decoder_factory(child, stripe))
             .collect::<Result<Vec<_>>>()?;
+
+        let fields = column
+            .children()?
+            .iter()
+            .map(|child| child.field())
+            .collect();
 
         Ok(Self {
             decoders,

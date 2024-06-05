@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType as ArrowDataType, Field};
 use bytes::Bytes;
-use snafu::ResultExt;
+use snafu::{ensure, ResultExt};
 
 use crate::error::{IoSnafu, Result};
+use crate::error::{MismatchedSchemaSnafu, UnexpectedSnafu, UnsupportedTypeVariantSnafu};
 use crate::proto::stream::Kind;
 use crate::proto::{ColumnEncoding, StripeFooter};
 use crate::reader::decode::boolean_rle::BooleanIter;
@@ -16,7 +18,10 @@ pub struct Column {
     number_of_rows: u64,
     footer: Arc<StripeFooter>,
     name: String,
+    /// ORC data type
     data_type: DataType,
+    /// Arrow field the column will be decoded into
+    field: Arc<Field>,
 }
 
 impl Column {
@@ -25,12 +30,14 @@ impl Column {
         data_type: &DataType,
         footer: &Arc<StripeFooter>,
         number_of_rows: u64,
+        field: Arc<Field>,
     ) -> Self {
         Self {
             number_of_rows,
             footer: footer.clone(),
             data_type: data_type.clone(),
             name: name.to_string(),
+            field,
         }
     }
 
@@ -58,7 +65,12 @@ impl Column {
         self.data_type.column_index() as u32
     }
 
-    pub fn children(&self) -> Vec<Column> {
+    pub fn field(&self) -> Arc<Field> {
+        self.field.clone()
+    }
+
+    pub fn children(&self) -> Result<Vec<Column>> {
+        let field_type = self.field.data_type();
         match &self.data_type {
             DataType::Boolean { .. }
             | DataType::Byte { .. }
@@ -74,53 +86,114 @@ impl Column {
             | DataType::Decimal { .. }
             | DataType::Timestamp { .. }
             | DataType::TimestampWithLocalTimezone { .. }
-            | DataType::Date { .. } => vec![],
-            DataType::Struct { children, .. } => children
-                .iter()
-                .map(|col| Column {
-                    number_of_rows: self.number_of_rows,
-                    footer: self.footer.clone(),
-                    name: col.name().to_string(),
-                    data_type: col.data_type().clone(),
-                })
-                .collect(),
-            DataType::List { child, .. } => {
-                vec![Column {
+            | DataType::Date { .. } => Ok(vec![]),
+            DataType::Struct { children, .. } => match field_type {
+                ArrowDataType::Struct(fields) => Ok(children
+                    .iter()
+                    .zip(fields.iter().cloned())
+                    .map(|(col, field)| Column {
+                        number_of_rows: self.number_of_rows,
+                        footer: self.footer.clone(),
+                        name: col.name().to_string(),
+                        data_type: col.data_type().clone(),
+                        field,
+                    })
+                    .collect()),
+                _ => MismatchedSchemaSnafu {
+                    orc_type: self.data_type.clone(),
+                    arrow_type: field_type.clone(),
+                }
+                .fail(),
+            },
+            DataType::List { child, .. } => match field_type {
+                ArrowDataType::List(field) => Ok(vec![Column {
                     number_of_rows: self.number_of_rows,
                     footer: self.footer.clone(),
                     name: "item".to_string(),
                     data_type: *child.clone(),
-                }]
-            }
+                    field: field.clone(),
+                }]),
+                // TODO: add support for ArrowDataType::LargeList
+                _ => MismatchedSchemaSnafu {
+                    orc_type: self.data_type.clone(),
+                    arrow_type: field_type.clone(),
+                }
+                .fail(),
+            },
             DataType::Map { key, value, .. } => {
-                vec![
+                let ArrowDataType::Map(entries, sorted) = field_type else {
+                    MismatchedSchemaSnafu {
+                        orc_type: self.data_type.clone(),
+                        arrow_type: field_type.clone(),
+                    }
+                    .fail()?
+                };
+                ensure!(!sorted, UnsupportedTypeVariantSnafu { msg: "Sorted map" });
+                let ArrowDataType::Struct(entries) = entries.data_type() else {
+                    UnexpectedSnafu {
+                        msg: "arrow Map with non-Struct entry type".to_owned(),
+                    }
+                    .fail()?
+                };
+                ensure!(
+                    entries.len() == 2,
+                    UnexpectedSnafu {
+                        msg: format!(
+                            "arrow Map with {} columns per entry (expected 2)",
+                            entries.len()
+                        )
+                    }
+                );
+                let key_field = entries[0].clone();
+                let value_field = entries[1].clone();
+                Ok(vec![
                     Column {
                         number_of_rows: self.number_of_rows,
                         footer: self.footer.clone(),
                         name: "key".to_string(),
                         data_type: *key.clone(),
+                        field: key_field,
                     },
                     Column {
                         number_of_rows: self.number_of_rows,
                         footer: self.footer.clone(),
                         name: "value".to_string(),
                         data_type: *value.clone(),
+                        field: value_field,
                     },
-                ]
+                ])
             }
-            DataType::Union { variants, .. } => {
-                // TODO: might need corrections
-                variants
-                    .iter()
-                    .enumerate()
-                    .map(|(index, data_type)| Column {
-                        number_of_rows: self.number_of_rows,
-                        footer: self.footer.clone(),
-                        name: format!("{index}"),
-                        data_type: data_type.clone(),
-                    })
-                    .collect()
-            }
+            DataType::Union { variants, .. } => match field_type {
+                ArrowDataType::Union(fields, _) => {
+                    // TODO: might need corrections
+                    Ok(variants
+                        .iter()
+                        .enumerate()
+                        .zip(fields.iter())
+                        .map(|((index, data_type), (index2, field))| {
+                            ensure!(
+                                index == index2 as usize,
+                                MismatchedSchemaSnafu {
+                                    orc_type: self.data_type.clone(),
+                                    arrow_type: field_type.clone(),
+                                }
+                            );
+                            Ok(Column {
+                                number_of_rows: self.number_of_rows,
+                                footer: self.footer.clone(),
+                                name: format!("{index}"),
+                                data_type: data_type.clone(),
+                                field: field.clone(),
+                            })
+                        })
+                        .collect::<Result<_>>()?)
+                }
+                _ => MismatchedSchemaSnafu {
+                    orc_type: self.data_type.clone(),
+                    arrow_type: field_type.clone(),
+                }
+                .fail(),
+            },
         }
     }
 

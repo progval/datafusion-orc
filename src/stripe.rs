@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Read, sync::Arc};
 
+use arrow::datatypes::Fields;
 use bytes::Bytes;
 use prost::Message;
 use snafu::ResultExt;
@@ -101,6 +102,7 @@ impl Stripe {
         reader: &mut R,
         file_metadata: &Arc<FileMetadata>,
         projected_data_type: &RootDataType,
+        fields: Fields,
         info: &StripeMetadata,
     ) -> Result<Self> {
         let compression = file_metadata.compression();
@@ -113,7 +115,16 @@ impl Stripe {
         let columns = projected_data_type
             .children()
             .iter()
-            .map(|col| Column::new(col.name(), col.data_type(), &footer, info.number_of_rows()))
+            .zip(fields.iter().cloned())
+            .map(|(col, field)| {
+                Column::new(
+                    col.name(),
+                    col.data_type(),
+                    &footer,
+                    info.number_of_rows(),
+                    field,
+                )
+            })
             .collect();
 
         let mut stream_map = HashMap::new();
@@ -153,6 +164,7 @@ impl Stripe {
         reader: &mut R,
         file_metadata: &Arc<FileMetadata>,
         projected_data_type: &RootDataType,
+        fields: Fields,
         info: &StripeMetadata,
     ) -> Result<Self> {
         let compression = file_metadata.compression();
@@ -166,7 +178,16 @@ impl Stripe {
         let columns = projected_data_type
             .children()
             .iter()
-            .map(|col| Column::new(col.name(), col.data_type(), &footer, info.number_of_rows()))
+            .zip(fields.iter().cloned())
+            .map(|(col, field)| {
+                Column::new(
+                    col.name(),
+                    col.data_type(),
+                    &footer,
+                    info.number_of_rows(),
+                    field,
+                )
+            })
             .collect();
 
         let mut stream_map = HashMap::new();

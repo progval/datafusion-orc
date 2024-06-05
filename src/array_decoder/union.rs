@@ -5,9 +5,10 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::UnionFields;
 use snafu::ResultExt;
 
+use crate::array_decoder::ArrowDataType;
 use crate::column::{get_present_vec, Column};
-use crate::error::ArrowSnafu;
 use crate::error::Result;
+use crate::error::{ArrowSnafu, MismatchedSchemaSnafu};
 use crate::proto::stream::Kind;
 use crate::reader::decode::byte_rle::ByteRleIter;
 use crate::stripe::Stripe;
@@ -25,7 +26,7 @@ pub struct UnionArrayDecoder {
 }
 
 impl UnionArrayDecoder {
-    pub fn new(column: &Column, fields: UnionFields, stripe: &Stripe) -> Result<Self> {
+    pub fn new(column: &Column, stripe: &Stripe) -> Result<Self> {
         let present = get_present_vec(column, stripe)?
             .map(|iter| Box::new(iter.into_iter()) as Box<dyn Iterator<Item = bool> + Send>);
 
@@ -33,14 +34,23 @@ impl UnionArrayDecoder {
         let tags = Box::new(ByteRleIter::new(tags));
 
         let variants = column
-            .children()
+            .children()?
             .iter()
-            .zip(fields.iter())
-            .map(|(child, (_id, field))| array_decoder_factory(child, field.clone(), stripe))
+            .map(|child| array_decoder_factory(child, stripe))
             .collect::<Result<Vec<_>>>()?;
 
+        // Cannot use column.children().map(|child| child.field()), because we need
+        // UnionFields instead of Fields
+        let ArrowDataType::Union(fields, _) = column.field().data_type() else {
+            MismatchedSchemaSnafu {
+                orc_type: column.data_type().clone(),
+                arrow_type: column.field().data_type().clone(),
+            }
+            .fail()?
+        };
+
         Ok(Self {
-            fields,
+            fields: fields.clone(),
             variants,
             tags,
             present,

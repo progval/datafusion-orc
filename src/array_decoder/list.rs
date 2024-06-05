@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, ListArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::{Field, FieldRef};
+use arrow::datatypes::FieldRef;
 use snafu::ResultExt;
 
 use crate::array_decoder::{derive_present_vec, populate_lengths_with_nulls};
@@ -23,12 +23,12 @@ pub struct ListArrayDecoder {
 }
 
 impl ListArrayDecoder {
-    pub fn new(column: &Column, field: Arc<Field>, stripe: &Stripe) -> Result<Self> {
+    pub fn new(column: &Column, stripe: &Stripe) -> Result<Self> {
         let present = get_present_vec(column, stripe)?
             .map(|iter| Box::new(iter.into_iter()) as Box<dyn Iterator<Item = bool> + Send>);
 
-        let child = &column.children()[0];
-        let inner = array_decoder_factory(child, field.clone(), stripe)?;
+        let child = &column.children()?[0];
+        let inner = array_decoder_factory(child, stripe)?;
 
         let reader = stripe.stream_map().get(column, Kind::Length);
         let lengths = get_rle_reader(column, reader)?;
@@ -37,7 +37,7 @@ impl ListArrayDecoder {
             inner,
             present,
             lengths,
-            field,
+            field: column.field(),
         })
     }
 }

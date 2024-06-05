@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, BooleanBuilder, PrimitiveArray, PrimitiveBuilder};
 use arrow::buffer::NullBuffer;
+use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, UInt64Type};
-use arrow::datatypes::{DataType as ArrowDataType, Field};
 use arrow::datatypes::{
     Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, SchemaRef,
     TimeUnit,
@@ -12,9 +12,7 @@ use arrow::record_batch::RecordBatch;
 use snafu::{ensure, ResultExt};
 
 use crate::column::{get_present_vec, Column};
-use crate::error::{
-    self, ArrowSnafu, MismatchedSchemaSnafu, Result, UnexpectedSnafu, UnsupportedTypeVariantSnafu,
-};
+use crate::error::{self, ArrowSnafu, MismatchedSchemaSnafu, Result};
 use crate::proto::stream::Kind;
 use crate::reader::decode::boolean_rle::BooleanIter;
 use crate::reader::decode::byte_rle::ByteRleIter;
@@ -320,10 +318,9 @@ pub trait ArrayBatchDecoder: Send {
 
 pub fn array_decoder_factory(
     column: &Column,
-    field: Arc<Field>,
     stripe: &Stripe,
 ) -> Result<Box<dyn ArrayBatchDecoder>> {
-    let field_type = field.data_type().clone();
+    let field_type = column.field().data_type().clone();
     let decoder: Box<dyn ArrayBatchDecoder> = match column.data_type() {
         // TODO: try make branches more generic, reduce duplication
         DataType::Boolean { .. } => {
@@ -494,73 +491,10 @@ pub fn array_decoder_factory(
                 .map(|iter| Box::new(iter.into_iter()) as Box<dyn Iterator<Item = bool> + Send>);
             Box::new(DateArrayDecoder::new(iter, present))
         }
-        DataType::Struct { .. } => match field_type {
-            ArrowDataType::Struct(fields) => {
-                Box::new(StructArrayDecoder::new(column, fields, stripe)?)
-            }
-            _ => MismatchedSchemaSnafu {
-                orc_type: column.data_type().clone(),
-                arrow_type: field_type,
-            }
-            .fail()?,
-        },
-        DataType::List { .. } => {
-            match field_type {
-                ArrowDataType::List(field) => {
-                    Box::new(ListArrayDecoder::new(column, field, stripe)?)
-                }
-                // TODO: add support for ArrowDataType::LargeList
-                _ => MismatchedSchemaSnafu {
-                    orc_type: column.data_type().clone(),
-                    arrow_type: field_type,
-                }
-                .fail()?,
-            }
-        }
-        DataType::Map { .. } => {
-            let ArrowDataType::Map(entries, sorted) = field_type else {
-                MismatchedSchemaSnafu {
-                    orc_type: column.data_type().clone(),
-                    arrow_type: field_type,
-                }
-                .fail()?
-            };
-            ensure!(!sorted, UnsupportedTypeVariantSnafu { msg: "Sorted map" });
-            let ArrowDataType::Struct(entries) = entries.data_type() else {
-                UnexpectedSnafu {
-                    msg: "arrow Map with non-Struct entry type".to_owned(),
-                }
-                .fail()?
-            };
-            ensure!(
-                entries.len() == 2,
-                UnexpectedSnafu {
-                    msg: format!(
-                        "arrow Map with {} columns per entry (expected 2)",
-                        entries.len()
-                    )
-                }
-            );
-            let keys_field = entries[0].clone();
-            let values_field = entries[1].clone();
-
-            Box::new(MapArrayDecoder::new(
-                column,
-                keys_field,
-                values_field,
-                stripe,
-            )?)
-        }
-        DataType::Union { .. } => match field_type {
-            ArrowDataType::Union(fields, _) => {
-                Box::new(UnionArrayDecoder::new(column, fields, stripe)?)
-            }
-            _ => MismatchedSchemaSnafu {
-                orc_type: column.data_type().clone(),
-                arrow_type: field_type,
-            }
-            .fail()?,
-        },
+        DataType::Struct { .. } => Box::new(StructArrayDecoder::new(column, stripe)?),
+        DataType::List { .. } => Box::new(ListArrayDecoder::new(column, stripe)?),
+        DataType::Map { .. } => Box::new(MapArrayDecoder::new(column, stripe)?),
+        DataType::Union { .. } => Box::new(UnionArrayDecoder::new(column, stripe)?),
     };
 
     Ok(decoder)
@@ -609,12 +543,8 @@ impl NaiveStripeDecoder {
         let mut decoders = Vec::with_capacity(stripe.columns().len());
         let number_of_rows = stripe.number_of_rows();
 
-        for (col, field) in stripe
-            .columns()
-            .iter()
-            .zip(schema_ref.fields.iter().cloned())
-        {
-            let decoder = array_decoder_factory(col, field, &stripe)?;
+        for col in stripe.columns().iter() {
+            let decoder = array_decoder_factory(col, &stripe)?;
             decoders.push(decoder);
         }
 
