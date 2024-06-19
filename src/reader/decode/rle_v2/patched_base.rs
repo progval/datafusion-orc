@@ -53,6 +53,7 @@ impl<N: NInt, R: Read> RleReaderV2<N, R> {
             .fail();
         }
         if (patch_bit_width + value_bit_width) > (N::BYTE_SIZE * 8) {
+            eprintln!("patch_bit_width= {} value_bit_width= {} N::BYTE_SIZE= {}", patch_bit_width, value_bit_width, N::BYTE_SIZE);
             return OutOfSpecSnafu {
                 msg: "combined patch width and value width cannot exceed the size of the integer type being decoded",
             }
